@@ -26,19 +26,26 @@ If you prefer not to link, run `./dist/mcjs`. During development, use
 ### Optimized CLI build
 
 `bun run build` produces `dist/mcjs` for the current platform. It uses Bun's
-production compilation, all three minification passes, tree shaking and
-ahead-of-time bytecode for all function depths. Function/class names and embedded
-source maps preserve useful errors. Runtime discovery of `.env`, `bunfig.toml`,
+production compilation, syntax and whitespace minification, tree shaking and
+ahead-of-time bytecode for all function depths. Identifier renaming is disabled:
+Bun 1.4.2's name-preservation option still renames dependency classes, breaking
+Mineflayer's constructor-name checks and result serialization. Embedded source maps
+preserve useful errors. Runtime discovery of `.env`, `bunfig.toml`,
 `tsconfig.json` and `package.json` is disabled for the compiled CLI; export
 configuration such as `MCJS_RUNTIME_DIR` and `XDG_STATE_HOME` in the environment.
 
-Keep the binary in the checkout's `dist/` directory; symlinks to it work from any
-directory. Docs, skills, package metadata, daemon source and installed dependencies
-remain in the checkout. The binary's embedded Bun runtime launches the daemon,
-so an installed Bun executable is not needed on `PATH` when running it. The daemon
-keeps bots connected between CLI calls and loads Mineflayer only in that process.
-Rebuild after changing CLI source or dependencies, and restart the daemon after
-changing daemon source or dependencies. See [Bun's executable build documentation](https://bun.com/docs/bundler/executables).
+The single binary includes the Bun runtime, CLI, daemon, Mineflayer dependencies,
+Minecraft data, docs and agent skill. Copy it to another machine with a compatible
+operating system and CPU architecture; no checkout, `node_modules`, or installed
+Bun is needed to run it. Build separately on each target platform.
+
+The CLI starts another instance of the same binary in daemon mode when needed.
+That process keeps bots connected between CLI calls; help and docs do not load
+Mineflayer. `skill path` extracts the bundled skill and references into a cache
+inside the profile's state directory so other tools can read them. Runtime state,
+logs and authentication caches remain separate from the executable.
+Rebuild after source, dependency or bundled documentation changes, and restart
+any running daemon to use the new build. See [Bun's executable build documentation](https://bun.com/docs/bundler/executables).
 
 Offline authentication is the default. For a local offline-mode test server:
 
@@ -185,7 +192,5 @@ intentionally leaves the following work visible:
   numbers currently refer to the transpiled wrapper.
 - Automated recovery of verified stale sockets/locks; current behavior refuses
   unresponsive existing endpoints and gives a diagnostic path.
-- Native Windows transport, per-bot process isolation, viewer distribution and
-  standalone packaging of the daemon, dependencies and assets (the compiled CLI
-  currently requires its checkout).
+- Native Windows transport, per-bot process isolation and optional viewer distribution.
 - Vanilla Java/current-protocol acceptance matrix and manual Microsoft auth checks.

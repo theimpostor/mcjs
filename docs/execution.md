@@ -14,6 +14,11 @@ Functions, BigInt, nonfinite numbers and cyclic objects are rejected.
 The serialized return value may be up to 1 MiB, with up to 256 KiB of retained
 log entries. Job retrieval includes room for both budgets and record metadata.
 
+In standalone builds, use the injected `Vec3`, `mcData`, `goals`, `Movements` and
+`bot` globals to access bundled libraries. Bundling does not install packages for
+dynamic imports by package name (for example, `import('vec3')`). Additional
+libraries must be provided separately.
+
 `botState` is a persistent in-memory JSON object per bot. `shared` is a store
 with revisions and leases. Globals include `signal`, an AbortSignal, and
 `helpers.checkpoint()` / `helpers.sleep(ms)` for cooperative cancellation.

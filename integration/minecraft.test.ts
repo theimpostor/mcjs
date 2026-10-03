@@ -1,6 +1,12 @@
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import type { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -390,29 +396,25 @@ test("job lookup avoids cloning histories across generations and removal", async
 }, 30_000);
 
 test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
-  "compiled CLI creates a live bot and runs JavaScript and TypeScript without Bun on PATH",
+  "a copied standalone binary runs a live bot and JavaScript and TypeScript without Bun on PATH",
   async () => {
     const working = mkdtempSync(join(tmpdir(), "mcjs-c-"));
+    const binary = join(working, "mcjs");
     const socket = join(working, "d.sock");
     const emptyPath = join(working, "empty-bin");
     mkdirSync(emptyPath);
+    copyFileSync(join(root, "dist", "mcjs"), binary);
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: emptyPath,
+      MCJS_RUNTIME_DIR: join(working, "runtime"),
       MCJS_STATE_DIR: join(working, "state"),
     };
     delete env.BUN_BE_BUN;
     let daemonPid: number | undefined;
     async function compiled<T>(...args: string[]) {
       const child = Bun.spawn(
-        [
-          join(root, "dist", "mcjs"),
-          ...args,
-          "--profile",
-          "compiled",
-          "--socket",
-          socket,
-        ],
+        [binary, ...args, "--profile", "compiled", "--socket", socket],
         { cwd: working, env, stdout: "pipe", stderr: "pipe" },
       );
       const watchdog = setTimeout(() => child.kill("SIGKILL"), 25_000);
@@ -465,6 +467,36 @@ test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
         x: expect.any(Number),
         y: expect.any(Number),
         z: expect.any(Number),
+      });
+      const objects = await compiled<Job>(
+        "exec",
+        "compiled",
+        "--timeout-ms",
+        "10000",
+        `while (!bot.entity.onGround) await helpers.sleep(20);
+         const block = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0));
+         if (!block) throw new Error('Ground block is not loaded');
+         return { entity: bot.entity, block };`,
+      );
+      expect(objects?.state).toBe("succeeded");
+      expect(objects?.result).toMatchObject({
+        entity: {
+          id: expect.any(Number),
+          position: {
+            x: expect.any(Number),
+            y: expect.any(Number),
+            z: expect.any(Number),
+          },
+        },
+        block: {
+          name: expect.any(String),
+          type: expect.any(Number),
+          position: {
+            x: expect.any(Number),
+            y: expect.any(Number),
+            z: expect.any(Number),
+          },
+        },
       });
       const ts = await compiled<Job>(
         "exec",

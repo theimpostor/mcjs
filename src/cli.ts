@@ -2,6 +2,7 @@
 import { cpSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { skillDirectory } from "./assets.ts";
 import { errorData, McjsError, requireValue } from "./errors.ts";
 import { Client } from "./ipc/client.ts";
 import { runtimePaths } from "./ipc/paths.ts";
@@ -126,10 +127,12 @@ export async function main(args = process.argv.slice(2)) {
     return;
   }
   if (command === "skill") {
-    const source = join(packageRoot, "skills", "mcjs");
-    if (action === "path") output(join(source, "SKILL.md"));
+    if (action === "path")
+      output(join(await skillDirectory(client.paths), "SKILL.md"));
     else if (action === "print")
-      output(await Bun.file(join(source, "SKILL.md")).text());
+      output(
+        await Bun.file(join(packageRoot, "skills", "mcjs", "SKILL.md")).text(),
+      );
     else if (action === "install") {
       const destination = join(resolve(required(flags.dir, "--dir")), "mcjs");
       if (existsSync(destination) && !flags.force)
@@ -138,7 +141,7 @@ export async function main(args = process.argv.slice(2)) {
           `${destination}; pass --force to overwrite`,
         );
       mkdirSync(dirname(destination), { recursive: true });
-      cpSync(source, destination, {
+      cpSync(await skillDirectory(client.paths), destination, {
         recursive: true,
         force: flags.force ?? false,
       });
@@ -409,8 +412,8 @@ export async function main(args = process.argv.slice(2)) {
   );
 }
 
-if (import.meta.main) {
-  main().catch((error) => {
+export async function runCli(args = process.argv.slice(2)) {
+  await main(args).catch((error) => {
     const data = errorData(error);
     console.log(
       JSON.stringify({
@@ -431,3 +434,5 @@ if (import.meta.main) {
           : 1;
   });
 }
+
+if (import.meta.main) void runCli();

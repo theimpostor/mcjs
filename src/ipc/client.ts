@@ -93,7 +93,9 @@ export class Client {
       const child = Bun.spawn(
         [
           process.execPath,
-          join(packageRoot, "src", "daemon", "main.ts"),
+          Bun.isStandaloneExecutable
+            ? "__mcjs_daemon"
+            : join(packageRoot, "src", "daemon", "main.ts"),
           profile,
           this.paths.socket,
         ],
@@ -101,10 +103,7 @@ export class Client {
           stdin: "ignore",
           stdout: logFd,
           stderr: logFd,
-          // The compiled CLI embeds Bun, which can also execute the daemon source.
-          env: Bun.isStandaloneExecutable
-            ? { ...process.env, BUN_BE_BUN: "1" }
-            : process.env,
+          env: process.env,
         },
       );
       closeSync(logFd);

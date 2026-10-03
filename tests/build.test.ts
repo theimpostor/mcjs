@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -7,19 +8,20 @@ import {
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Envelope } from "../src/protocol.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const directory = mkdtempSync(join(tmpdir(), "mcjs-build-"));
-const binary = join(root, "dist", "mcjs");
-const linked = join(directory, "mcjs");
+const binary = join(directory, "mcjs");
+const linked = join(directory, "mcjs-link");
 const socket = join(directory, "d.sock");
 const emptyPath = join(directory, "empty-bin");
 const env: NodeJS.ProcessEnv = {
   ...process.env,
   PATH: emptyPath,
+  MCJS_RUNTIME_DIR: join(directory, "runtime"),
   MCJS_STATE_DIR: join(directory, "state"),
 };
 delete env.BUN_BE_BUN;
@@ -65,6 +67,7 @@ async function cli<T>(executable: string, ...args: string[]) {
 beforeAll(async () => {
   await subprocess([process.execPath, "run", "build"], { cwd: root }, 60_000);
   mkdirSync(emptyPath);
+  copyFileSync(join(root, "dist", "mcjs"), binary);
   symlinkSync(binary, linked);
 }, 65_000);
 
@@ -72,7 +75,7 @@ afterAll(() => {
   rmSync(directory, { recursive: true, force: true });
 });
 
-test("compiled CLI finds offline assets from another directory and through a symlink", async () => {
+test("a copied standalone binary provides its assets directly and through a symlink", async () => {
   for (const executable of [binary, linked]) {
     expect((await cli<string>(executable, "--help")).data).toContain(
       "mcjs exec",
@@ -87,7 +90,12 @@ test("compiled CLI finds offline assets from another directory and through a sym
     );
     expect(docs.data?.versions.mineflayer).toBe("4.39.0");
     const skillPath = (await cli<string>(executable, "skill", "path")).data;
-    expect(skillPath).toBe(join(root, "skills", "mcjs", "SKILL.md"));
+    if (!skillPath) throw new Error("Missing extracted skill path");
+    expect(skillPath.startsWith(join(directory, "state"))).toBe(true);
+    for (const path of ["SKILL.md", "references/workflow.md"])
+      expect(await Bun.file(join(dirname(skillPath), path)).text()).toBe(
+        await Bun.file(join(root, "skills", "mcjs", path)).text(),
+      );
     expect((await cli<string>(executable, "skill", "print")).data).toBe(
       await Bun.file(join(root, "skills", "mcjs", "SKILL.md")).text(),
     );
@@ -117,10 +125,10 @@ test("compiled CLI finds offline assets from another directory and through a sym
     expect(await Bun.file(join(destination, "mcjs", path)).text()).toBe(
       await Bun.file(join(root, "skills", "mcjs", path)).text(),
     );
-});
+}, 20_000);
 
 test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
-  "compiled CLI manages an independent daemon without Bun on PATH",
+  "a copied standalone binary manages its daemon without Bun on PATH",
   async () => {
     let pid: number | undefined;
     try {
