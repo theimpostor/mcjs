@@ -4,6 +4,8 @@ Create named bots with unique identities. `exec-many scout,builder '<code>'` or
 `exec-all '<code>'` submits separate jobs. Each executes with its own bot and
 botState. Fleet results preserve successes and failures independently; there is
 no transaction or rollback. exec-all snapshots ready bot IDs when it starts.
+Submission concurrency is bounded, but waiting for job completion does not hold
+up submission to the remaining bots.
 
 Use shared.get(key) to read {value, revision}. To update:
 
@@ -30,7 +32,9 @@ try {
 }
 ```
 
-Claims are owned by the current job and released on job termination. The token
-is needed to renew or release a lease. TTL is 1..300000 ms. Cooperative leases do
-not stop other Minecraft players from using the same resource. All state is in
-memory and is lost on daemon restart; bot reconnect preserves botState.
+Claims are owned by the current job and released on job termination. Cancellation
+keeps claims during cooperative cleanup, until the execution settles or its
+cancellation grace period ends; explicit release and TTL expiry still apply.
+The token is needed to renew or release a lease. TTL is 1..300000 ms. Cooperative
+leases do not stop other Minecraft players from using the same resource. All
+state is in memory and is lost on daemon restart; bot reconnect preserves botState.

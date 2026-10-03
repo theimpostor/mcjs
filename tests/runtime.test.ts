@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Vec3 } from "vec3";
 import { Deduplicator } from "../src/ipc/dedup.ts";
+import { MAX_EVENT_RESPONSE_BYTES, MAX_LOG_BYTES } from "../src/protocol.ts";
 import { EventBuffer } from "../src/runtime/events.ts";
 import { abortableSleep, executeCode } from "../src/runtime/execute.ts";
 import { isTerminal, type Job, JobQueue } from "../src/runtime/jobs.ts";
@@ -175,6 +176,99 @@ describe("jobs", () => {
     expect((await terminal(q, a.id)).error?.code).toBe("SERIALIZATION_ERROR");
     expect((await terminal(q, b.id)).result).toBe(2);
   });
+  test("cancellation retains leases until asynchronous finally completes", async () => {
+    const store = new SharedStore();
+    const started = Promise.withResolvers<void>();
+    const aborted = Promise.withResolvers<void>();
+    const finalizing = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    let cleanups = 0;
+    const q = new JobQueue("test", 1, {
+      execute: async (_input, signal, _log, jobId) => {
+        store.claim("chest", { owner: jobId, ttlMs: 1000 });
+        started.resolve();
+        try {
+          await abortableSleep(1000, signal);
+        } finally {
+          finalizing.resolve();
+          await finish.promise;
+        }
+      },
+      abort: () => aborted.resolve(),
+      cleanup: (jobId) => {
+        cleanups++;
+        store.releaseOwner(jobId);
+      },
+      quarantine: () => {},
+      changed: () => {},
+    });
+    const job = q.submit(input("lease"));
+    await started.promise;
+    q.cancel(job.id);
+    try {
+      await Promise.all([aborted.promise, finalizing.promise]);
+      expect(q.get(job.id).state).toBe("running");
+      expect(cleanups).toBe(0);
+      expect(() =>
+        store.claim("chest", { owner: "other", ttlMs: 1000 }),
+      ).toThrow("claimed");
+    } finally {
+      finish.resolve();
+    }
+    expect((await terminal(q, job.id)).state).toBe("canceled");
+    expect(cleanups).toBe(1);
+    expect(store.claim("chest", { owner: "other", ttlMs: 1000 }).owner).toBe(
+      "other",
+    );
+  });
+  test("job lookup and summaries avoid cloning execution payloads", async () => {
+    const { q } = queue();
+    const completed = q.submit(input("return 'x'.repeat(256 * 1024)"));
+    await terminal(q, completed.id);
+    const running = q.submit(input("await sleep(1000)"));
+    const queued = q.submit(input("return 2"));
+    const clone = spyOn(globalThis, "structuredClone");
+    try {
+      expect(q.has(completed.id)).toBe(true);
+      expect(q.has(running.id)).toBe(true);
+      expect(q.has(queued.id)).toBe(true);
+      expect(q.has("unknown")).toBe(false);
+      expect(clone).not.toHaveBeenCalled();
+      const summaries = q.listSummaries();
+      expect(summaries.map((j) => j.state)).toEqual([
+        "succeeded",
+        "running",
+        "queued",
+      ]);
+      for (const [value] of clone.mock.calls) {
+        expect(value).not.toHaveProperty("result");
+        expect(value).not.toHaveProperty("logs");
+        expect(value).not.toHaveProperty("sourceHash");
+      }
+      if (summaries[0]) summaries[0].state = "failed";
+    } finally {
+      clone.mockRestore();
+      q.cancel(running.id);
+      q.cancel(queued.id);
+    }
+    expect(q.get(completed.id).state).toBe("succeeded");
+    await terminal(q, running.id);
+  });
+  test("log retention counts array separators and brackets", async () => {
+    const q = new JobQueue("test", 1, {
+      execute: async (_input, _signal, log) => {
+        for (let i = 0; i < MAX_LOG_BYTES / 2; i++) log();
+      },
+      cleanup: () => {},
+      quarantine: () => {},
+      changed: () => {},
+    });
+    const job = await terminal(q, q.submit(input("logs")).id);
+    expect(job.state).toBe("succeeded");
+    const bytes = Buffer.byteLength(JSON.stringify(job.logs));
+    expect(bytes).toBeLessThanOrEqual(MAX_LOG_BYTES);
+    expect(bytes + 3).toBeGreaterThan(MAX_LOG_BYTES);
+  });
 });
 
 describe("protocol history", () => {
@@ -199,5 +293,43 @@ describe("protocol history", () => {
     expect(() => events.read(first)).toThrow("Oldest");
     expect(() => events.read("other:bot:1")).toThrow("another");
     expect(events.read().events.map((e) => e.type)).toEqual(["c", "d"]);
+  });
+  test("event pages preserve a large multibyte history without gaps", () => {
+    const buffer = new EventBuffer(crypto.randomUUID(), "bot");
+    const expected: string[] = [];
+    for (let i = 0; i < 80; i++)
+      expected.push(buffer.push("chat", { text: "🌍".repeat(8000), i }, 1));
+    const cursors: string[] = [];
+    let page = buffer.read();
+    let pages = 0;
+    for (;;) {
+      pages++;
+      expect(page.events.length).toBeGreaterThan(0);
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(
+        MAX_EVENT_RESPONSE_BYTES,
+      );
+      expect(page.events.at(-1)?.cursor).toBe(page.cursor);
+      cursors.push(...page.events.map((event) => event.cursor));
+      if (!page.hasMore) break;
+      page = buffer.read(page.cursor);
+    }
+    expect(pages).toBeGreaterThan(1);
+    expect(cursors).toEqual(expected);
+    expect(buffer.read(page.cursor)).toEqual({
+      events: [],
+      cursor: page.cursor,
+      hasMore: false,
+    });
+  });
+  test("empty history returns a reusable cursor", () => {
+    const buffer = new EventBuffer("daemon", "bot");
+    const empty = buffer.read();
+    expect(empty.events).toEqual([]);
+    expect(empty.hasMore).toBe(false);
+    const cursor = buffer.push("ready", {}, 1);
+    const next = buffer.read(empty.cursor);
+    expect(next.events.map((event) => event.cursor)).toEqual([cursor]);
+    expect(next.cursor).toBe(cursor);
+    expect(next.hasMore).toBe(false);
   });
 });

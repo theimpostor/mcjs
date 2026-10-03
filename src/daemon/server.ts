@@ -9,6 +9,7 @@ import {
   type Envelope,
   execSchema,
   idSchema,
+  MAX_JOB_RESPONSE_BYTES,
   PROTOCOL,
   requestSchema,
   VERSION,
@@ -47,6 +48,11 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
     bots: bots.sessions.size,
   });
   let stopping = false;
+  let stopTask: Promise<void> | undefined;
+  let resolveStopped = () => {};
+  const stopped = new Promise<void>((resolve) => {
+    resolveStopped = resolve;
+  });
   const dispatch = async (
     method: string,
     params: unknown,
@@ -57,7 +63,7 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
         return status();
       case "daemon.stop":
         empty.parse(params);
-        setTimeout(stop, 50);
+        setTimeout(() => void stop(false), 50);
         return { stopping: true };
       case "bot.create":
         return bots.create(botConfigSchema.parse(params));
@@ -175,8 +181,9 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
             "BOT_BUSY",
             "Cannot replace state while an execution is active",
           );
+        const replacement = serialize(value);
         session.botState = value;
-        return serialize(value);
+        return replacement;
       }
       case "shared.get":
         return bots.shared.get(
@@ -209,6 +216,7 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
     "state.get",
     "shared.get",
   ]);
+  const jobMethods = new Set(["exec.submit", "job.get", "job.cancel"]);
   const handler = async (req: Request) => {
     const started = performance.now();
     let requestId = "unknown";
@@ -242,10 +250,21 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
       if (stopping) throw new McjsError("STOPPING", "Daemon is stopping");
       const run = async () => {
         try {
-          return envelope(
-            true,
-            serialize(await dispatch(request.method, request.params)),
-          );
+          const value = await dispatch(request.method, request.params);
+          // Queue DTOs already contain projected JSON. Reprojecting their
+          // result/logs would apply the depth limit again at a deeper level.
+          if (jobMethods.has(request.method)) {
+            const result = envelope(true, value);
+            if (
+              Buffer.byteLength(JSON.stringify(result)) > MAX_JOB_RESPONSE_BYTES
+            )
+              throw new McjsError(
+                "RESULT_TOO_LARGE",
+                `Job response exceeds ${MAX_JOB_RESPONSE_BYTES} bytes`,
+              );
+            return result;
+          }
+          return envelope(true, serialize(value));
         } catch (error) {
           return envelope(
             false,
@@ -287,16 +306,29 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
       });
   if (!listen) chmodSync(paths.socket, 0o600);
   await Bun.write(paths.metadata, JSON.stringify(status()), { mode: 0o600 });
-  async function stop() {
-    if (stopping) return;
+  function stop(close = true): Promise<void> {
+    if (stopTask) return stopTask;
     stopping = true;
-    bots.stop();
-    await server.stop(true);
-    for (const path of [paths.socket, paths.token, paths.metadata]) {
+    stopTask = (async () => {
+      bots.stop();
+      // Let the shutdown receipt flush, but do not wait forever on another
+      // client that leaves an HTTP request open.
+      const deadline = close
+        ? undefined
+        : setTimeout(() => void server.stop(true), 1_000);
       try {
-        unlinkSync(path);
-      } catch {}
-    }
+        await server.stop(close);
+      } finally {
+        clearTimeout(deadline);
+      }
+      for (const path of [paths.socket, paths.token, paths.metadata]) {
+        try {
+          unlinkSync(path);
+        } catch {}
+      }
+      resolveStopped();
+    })();
+    return stopTask;
   }
-  return { server, stop, status, bots };
+  return { server, stop, stopped, status, bots };
 }

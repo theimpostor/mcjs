@@ -5,9 +5,10 @@
   "description": "Programmable Minecraft bots for coding agents, powered by Bun and Mineflayer",
   "type": "module",
   "bin": {
-    "mcjs": "./src/cli.ts"
+    "mcjs": "./dist/mcjs"
   },
   "scripts": {
+    "build": "bun build ./src/cli.ts --compile --bytecode --minify --keep-names --sourcemap --no-compile-autoload-dotenv --no-compile-autoload-bunfig --no-compile-autoload-tsconfig --no-compile-autoload-package-json --outfile ./dist/mcjs",
     "mcjs": "bun src/cli.ts",
     "lint": "biome check .",
     "format": "biome check --write .",

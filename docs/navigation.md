@@ -14,6 +14,9 @@ Find nearby blocks with bot.findBlock({matching: b => b.name === 'oak_log',
 maxDistance: 32}). Check null. Search only covers loaded chunks. For gathering,
 `await helpers.collect(block)` uses the collection plugin's navigation, tool
 selection, digging and drop collection. Inspect inventory after completion.
+With the default navigation settings, the helper permits breaking the requested
+blocks while protecting other terrain, and restores navigation settings afterward.
+Direct bot.collectBlock.collect calls use the upstream plugin's movement settings.
 `await bot.tool.equipForBlock(block)` selects a suitable available tool.
 
 PVP is opt-in at bot creation with --plugins pathfinder,tool,collectblock,pvp.

@@ -11,7 +11,7 @@ import { McjsError } from "../errors.ts";
 import type { BotConfig, ExecInput } from "../protocol.ts";
 import { EventBuffer } from "./events.ts";
 import { abortableSleep, executeCode } from "./execute.ts";
-import { type Job, JobQueue } from "./jobs.ts";
+import { JobQueue, type JobSummary } from "./jobs.ts";
 import { type JsonValue, serialize } from "./serialize.ts";
 import { SharedStore } from "./state.ts";
 
@@ -50,6 +50,7 @@ export class BotSession {
       ...(config.version ? { version: config.version } : {}),
       profilesFolder: accountDir,
       onMsaCode: (data) => {
+        if (this.unavailable()) return;
         this.state = "auth_required";
         this.authPrompt = { uri: data.verification_uri, code: data.user_code };
         this.emit("auth_required", {
@@ -81,8 +82,7 @@ export class BotSession {
     );
     this.bot.on("end", (reason) => {
       clearTimeout(this.spawnTimer);
-      if (this.state !== "removed" && this.state !== "failed")
-        this.state = "disconnected";
+      if (!this.unavailable()) this.state = "disconnected";
       this.queue.interrupt("Minecraft connection ended");
       this.emit("disconnected", {
         reason: String(reason).slice(0, 8000),
@@ -109,16 +109,12 @@ export class BotSession {
     let spawned = false;
     this.bot.on("spawn", async () => {
       clearTimeout(this.spawnTimer);
+      if (this.unavailable()) return;
       if (spawned) {
         this.state = "respawning";
         this.queue.interrupt("World changed or bot respawned");
         while (this.queue.busy) await Bun.sleep(10);
-        if (
-          this.state === "quarantined" ||
-          this.state === "removed" ||
-          this.state === "disconnected"
-        )
-          return;
+        if (this.unavailable()) return;
         this.rotateQueue("World changed or bot respawned");
       }
       spawned = true;
@@ -127,17 +123,20 @@ export class BotSession {
         movements.canDig = false;
         movements.allow1by1towers = false;
         this.bot.pathfinder.setMovements(movements);
+        if (this.bot.pvp) this.bot.pvp.movements = movements;
       }
       this.state = "ready";
       this.authPrompt = null;
       this.emit("ready", { version: this.bot.version });
     });
     this.bot.on("death", () => {
+      if (this.unavailable()) return;
       this.queue.interrupt("Bot died");
       this.state = "respawning";
       this.emit("death", {});
     });
     this.bot.on("respawn", () => {
+      if (this.unavailable()) return;
       if (spawned) {
         this.queue.interrupt("Dimension or world changed");
         this.state = "respawning";
@@ -155,6 +154,11 @@ export class BotSession {
     );
     this.emit("connecting", { host: config.host, port: config.port });
   }
+  private unavailable() {
+    return ["quarantined", "removed", "disconnected", "failed"].includes(
+      this.state,
+    );
+  }
   private emit(type: string, data: unknown) {
     this.events.push(type, data, this.generation);
   }
@@ -169,12 +173,16 @@ export class BotSession {
     return new JobQueue(this.config.id, generation, {
       execute: (input, signal, log, jobId) =>
         this.execute(input, signal, log, jobId),
+      abort: () => {
+        if (generation === this.generation) this.stopControls();
+      },
       cleanup: (jobId) => {
         this.shared.releaseOwner(jobId);
         if (generation === this.generation) this.stopControls();
       },
       quarantine: () => {
-        if (generation === this.generation) this.state = "quarantined";
+        if (generation === this.generation && !this.unavailable())
+          this.state = "quarantined";
       },
       changed: (job) =>
         this.events?.push("job", { id: job.id, state: job.state }, generation),
@@ -186,12 +194,15 @@ export class BotSession {
     return this.queue.submit(input);
   }
   listJobs() {
-    return [...this.retiredQueues, this.queue].flatMap((q) => q.list());
+    return [...this.retiredQueues, this.queue].flatMap((q) =>
+      q.listSummaries(),
+    );
+  }
+  hasJob(id: string) {
+    return [...this.retiredQueues, this.queue].some((q) => q.has(id));
   }
   jobQueue(id: string) {
-    const queue = [...this.retiredQueues, this.queue].find((q) =>
-      q.list().some((j) => j.id === id),
-    );
+    const queue = [...this.retiredQueues, this.queue].find((q) => q.has(id));
     if (!queue) throw new McjsError("JOB_NOT_FOUND", id);
     return queue;
   }
@@ -242,9 +253,10 @@ export class BotSession {
         Promise.resolve(action()).catch(() => {});
       } catch {}
     };
-    safely(() => this.bot.pathfinder?.setGoal(null));
     safely(() => this.bot.collectBlock?.cancelTask());
-    safely(() => this.bot.pvp?.stop());
+    safely(() => this.bot.pvp?.forceStop());
+    // Flush any deferred pathfinder stop before the next job installs a goal.
+    safely(() => this.bot.pathfinder?.setGoal(null));
     safely(() => this.bot.clearControlStates());
     safely(() => this.bot.stopDigging());
     safely(() => this.bot.deactivateItem());
@@ -253,7 +265,7 @@ export class BotSession {
     });
   }
   stop() {
-    for (const job of this.queue.list())
+    for (const job of this.queue.listSummaries())
       if (job.state === "running" || job.state === "queued")
         this.queue.cancel(job.id);
     this.stopControls();
@@ -292,8 +304,31 @@ export class BotSession {
         checkpoint();
         if (!this.bot.collectBlock)
           throw new McjsError("PLUGIN_MISSING", "collectblock");
-        await this.bot.collectBlock.collect(target);
-        checkpoint();
+        const previous = this.bot.pathfinder.movements;
+        const collection = this.bot.collectBlock.movements;
+        const movements = Object.assign(new Movements(this.bot), previous);
+        const targets = new Set(
+          (Array.isArray(target) ? target : [target])
+            .filter((item) => item.constructor.name === "Block")
+            .map((block) => block.position.toString()),
+        );
+        // Collectblock checks safeToBreak for explicit digs too. Permit those
+        // blocks while rejecting incidental terrain removal along the route.
+        movements.canDig = true;
+        movements.exclusionAreasBreak = [...previous.exclusionAreasBreak];
+        if (!previous.canDig)
+          movements.exclusionAreasBreak.push((block) =>
+            targets.has(block.position.toString()) ? 0 : 100,
+          );
+        this.bot.collectBlock.movements = movements;
+        try {
+          await this.bot.collectBlock.collect(target);
+          checkpoint();
+        } finally {
+          if (collection) this.bot.collectBlock.movements = collection;
+          else delete this.bot.collectBlock.movements;
+          this.bot.pathfinder.setMovements(previous);
+        }
       },
     };
     const shared = {
@@ -376,7 +411,7 @@ export class BotManager {
   }
   reconnect(id: string) {
     const old = this.get(id);
-    const state = old.botState;
+    const state = serialize(old.botState) as Record<string, JsonValue>;
     this.remove(id);
     const session = new BotSession(
       old.config,
@@ -389,14 +424,14 @@ export class BotManager {
     this.sessions.set(id, session);
     return session.info();
   }
-  jobs(): Job[] {
+  jobs(): JobSummary[] {
     return [...this.retired, ...this.sessions.values()].flatMap((s) =>
       s.listJobs(),
     );
   }
   jobQueue(id: string) {
     const session = [...this.retired, ...this.sessions.values()].find((s) =>
-      s.listJobs().some((j) => j.id === id),
+      s.hasJob(id),
     );
     if (!session) throw new McjsError("JOB_NOT_FOUND", id);
     return session.jobQueue(id);

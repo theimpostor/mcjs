@@ -3,6 +3,13 @@ import { z } from "zod";
 export const VERSION = "0.1.0";
 export const PROTOCOL = 1;
 export const MAX_RESULT_BYTES = 1024 * 1024;
+export const MAX_LOG_BYTES = 256 * 1024;
+export const MAX_LOG_ENTRY_BYTES = 64 * 1024;
+export const MAX_RPC_RESPONSE_BYTES = MAX_RESULT_BYTES;
+export const MAX_JOB_RESPONSE_BYTES =
+  MAX_RESULT_BYTES + MAX_LOG_BYTES + 64 * 1024;
+export const MAX_EVENT_RESPONSE_BYTES = MAX_RPC_RESPONSE_BYTES;
+export const MAX_EVENT_PAYLOAD_BYTES = 64 * 1024;
 export const idSchema = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,47}$/);
 export const botConfigSchema = z
   .object({
@@ -10,7 +17,7 @@ export const botConfigSchema = z
     host: z.string().min(1).default("localhost"),
     port: z.number().int().min(1).max(65535).default(25565),
     username: z.string().min(1),
-    auth: z.enum(["offline", "microsoft"]).default("microsoft"),
+    auth: z.enum(["offline", "microsoft"]).default("offline"),
     version: z.string().min(1).optional(),
     plugins: z
       .array(z.enum(["pathfinder", "tool", "collectblock", "pvp"]))

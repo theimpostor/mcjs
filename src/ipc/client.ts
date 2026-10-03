@@ -1,7 +1,7 @@
 import { closeSync, lstatSync, openSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { McjsError } from "../errors.ts";
+import { packageRoot } from "../package-root.ts";
 import { type Envelope, PROTOCOL } from "../protocol.ts";
 import { privateDirectory, type RuntimePaths } from "./paths.ts";
 
@@ -93,7 +93,7 @@ export class Client {
       const child = Bun.spawn(
         [
           process.execPath,
-          fileURLToPath(new URL("../daemon/main.ts", import.meta.url)),
+          join(packageRoot, "src", "daemon", "main.ts"),
           profile,
           this.paths.socket,
         ],
@@ -101,7 +101,10 @@ export class Client {
           stdin: "ignore",
           stdout: logFd,
           stderr: logFd,
-          env: process.env,
+          // The compiled CLI embeds Bun, which can also execute the daemon source.
+          env: Bun.isStandaloneExecutable
+            ? { ...process.env, BUN_BE_BUN: "1" }
+            : process.env,
         },
       );
       closeSync(logFd);

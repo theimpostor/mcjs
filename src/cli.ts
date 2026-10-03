@@ -1,15 +1,20 @@
 #!/usr/bin/env bun
 import { cpSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { errorData, McjsError, requireValue } from "./errors.ts";
 import { Client } from "./ipc/client.ts";
 import { runtimePaths } from "./ipc/paths.ts";
-import { type Envelope, PROTOCOL, VERSION } from "./protocol.ts";
+import { packageRoot } from "./package-root.ts";
+import {
+  botConfigSchema,
+  type Envelope,
+  execSchema,
+  PROTOCOL,
+  VERSION,
+} from "./protocol.ts";
 import { isTerminal, type Job } from "./runtime/jobs.ts";
 
-const packageRoot = fileURLToPath(new URL("../", import.meta.url));
 const options = {
   help: { type: "boolean", short: "h" },
   human: { type: "boolean" },
@@ -48,7 +53,7 @@ const help = `mcjs ${VERSION} — programmable Minecraft bots
 
 mcjs daemon start|status|stop
 mcjs doctor
-mcjs bot create <id> --username <name> [--host localhost --port 25565 --auth microsoft|offline]
+mcjs bot create <id> --username <name> [--host localhost --port 25565 --auth offline|microsoft]
 mcjs bot list|info|snapshot|stop|remove|reconnect [id]
 mcjs exec <bot> '<JavaScript>' [--background --timeout-ms 30000 --wait-ms 30000]
 mcjs exec <bot> --stdin|--file script.ts [--lang js|ts]
@@ -62,6 +67,7 @@ mcjs docs [topic]
 mcjs skill path|print|install [--dir <skill-root> --force]
 
 Global: --profile default --socket <path> --human
+Bot authentication defaults to offline; use --auth microsoft for online-mode servers.
 JSON stdout by default. JavaScript runs as a trusted async function body; return results.
 Use --stdin with a quoted heredoc to prevent shell interpolation. See mcjs docs.
 `;
@@ -179,8 +185,7 @@ export async function main(args = process.argv.slice(2)) {
     }
     const id = required(target, "bot ID");
     if (action === "create") {
-      await client.start(flags.profile);
-      await client.rpc("bot.create", {
+      const config = botConfigSchema.safeParse({
         id,
         username: required(flags.username, "--username"),
         host: flags.host,
@@ -189,12 +194,15 @@ export async function main(args = process.argv.slice(2)) {
         version: flags.version,
         plugins: flags.plugins?.split(","),
       });
-      const until =
-        Date.now() +
-        numberOption(
-          flags["wait-ms"],
-          flags.auth === "offline" ? 30_000 : 300_000,
-        );
+      if (!config.success)
+        throw new McjsError("INVALID_ARGUMENT", config.error.message);
+      const waitMs = numberOption(
+        flags["wait-ms"],
+        config.data.auth === "offline" ? 30_000 : 300_000,
+      );
+      await client.start(flags.profile);
+      await client.rpc("bot.create", config.data);
+      const until = Date.now() + waitMs;
       let printedAuth = false;
       for (;;) {
         const envelope = await client.rpc<{
@@ -273,46 +281,62 @@ export async function main(args = process.argv.slice(2)) {
         "INVALID_ARGUMENT",
         "Select at least one bot without duplicate IDs",
       );
-    const results: Record<string, unknown> = Object.create(null);
-    let failures = 0;
-    const run = async (id: string) => {
-      const result = await client.rpc<Job>("exec.submit", {
+    const timeoutMs = numberOption(flags["timeout-ms"], 30_000);
+    const waitMs = numberOption(flags["wait-ms"], timeoutMs + 3_000);
+    const inputs = ids.map((id) => {
+      const parsed = execSchema.safeParse({
         botId: id,
         code,
         lang: flags.lang ?? (flags.file?.endsWith(".ts") ? "ts" : "js"),
-        timeoutMs: numberOption(flags["timeout-ms"], 30_000),
+        timeoutMs,
         ifBusy: flags["if-busy"] ?? "queue",
       });
-      return flags.background || !result.data
+      if (!parsed.success)
+        throw new McjsError("INVALID_ARGUMENT", parsed.error.message);
+      return parsed.data;
+    });
+    const results: Record<string, unknown> = Object.create(null);
+    let failures = 0;
+    const waitForReceipt = (result: Envelope<Job>) =>
+      flags.background || !result.data
         ? result
-        : waitJob(
-            result.data.id,
-            numberOption(
-              flags["wait-ms"],
-              numberOption(flags["timeout-ms"], 30_000) + 3_000,
-            ),
-          );
-    };
+        : waitJob(result.data.id, waitMs);
     if (command === "exec") {
-      const result = await run(required(ids[0], "bot ID"));
+      const result = await waitForReceipt(
+        await client.rpc<Job>("exec.submit", inputs[0]),
+      );
       emit(result);
       process.exitCode = jobExit(result.data);
       return;
     }
+    const receipts: { id: string; result: Envelope<Job> }[] = [];
     let next = 0;
     await Promise.all(
-      Array.from({ length: Math.min(ids.length, 4) }, async () => {
+      Array.from({ length: Math.min(inputs.length, 4) }, async () => {
         for (;;) {
-          const id = ids[next++];
-          if (!id) return;
+          const input = inputs[next++];
+          if (!input) return;
           try {
-            const result = await run(id);
-            results[id] = result;
-            if (jobExit(result.data)) failures++;
+            receipts.push({
+              id: input.botId,
+              result: await client.rpc<Job>("exec.submit", input),
+            });
           } catch (error) {
-            results[id] = { ok: false, error: errorData(error) };
+            results[input.botId] = { ok: false, error: errorData(error) };
             failures++;
           }
+        }
+      }),
+    );
+    await Promise.all(
+      receipts.map(async ({ id, result: receipt }) => {
+        try {
+          const result = await waitForReceipt(receipt);
+          results[id] = result;
+          if (jobExit(result.data)) failures++;
+        } catch (error) {
+          results[id] = { ok: false, error: errorData(error) };
+          failures++;
         }
       }),
     );
@@ -339,13 +363,14 @@ export async function main(args = process.argv.slice(2)) {
     const id = required(action, "bot ID");
     let since = flags.since;
     do {
-      const result = await client.rpc<{ events: unknown[]; cursor: string }>(
-        "events",
-        { id, since },
-      );
+      const result = await client.rpc<{
+        events: unknown[];
+        cursor: string;
+        hasMore: boolean;
+      }>("events", { id, since });
       emit(result);
       since = result.data?.cursor;
-      if (flags.follow) await Bun.sleep(500);
+      if (flags.follow && !result.data?.hasMore) await Bun.sleep(500);
     } while (flags.follow);
     return;
   }

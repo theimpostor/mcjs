@@ -1,5 +1,9 @@
 import { errorData, McjsError } from "../errors.ts";
-import type { ExecInput } from "../protocol.ts";
+import {
+  type ExecInput,
+  MAX_LOG_BYTES,
+  MAX_LOG_ENTRY_BYTES,
+} from "../protocol.ts";
 import { type JsonValue, serialize } from "./serialize.ts";
 
 export type JobState =
@@ -23,6 +27,7 @@ export interface Job {
   error?: ReturnType<typeof errorData>;
   logs: JsonValue[];
 }
+export type JobSummary = Omit<Job, "sourceHash" | "result" | "logs">;
 interface Work {
   job: Job;
   input: ExecInput;
@@ -37,6 +42,7 @@ export interface ExecutionHooks {
     log: (...values: unknown[]) => void,
     jobId: string,
   ) => Promise<unknown>;
+  abort?: (jobId: string) => void;
   cleanup: (jobId: string) => void;
   quarantine: () => void;
   changed: (job: Job) => void;
@@ -86,7 +92,7 @@ export class JobQueue {
       job,
       input,
       abort: new AbortController(),
-      logBytes: 0,
+      logBytes: 2,
     };
     this.jobs.set(job.id, work);
     this.queue.push(work);
@@ -109,8 +115,22 @@ export class JobQueue {
     if (!work) throw new McjsError("JOB_NOT_FOUND", id);
     return structuredClone(work.job);
   }
+  has(id: string) {
+    return this.jobs.has(id);
+  }
   list() {
     return [...this.jobs.values()].map((w) => structuredClone(w.job));
+  }
+  listSummaries(): JobSummary[] {
+    return [...this.jobs.values()].map(({ job }) => {
+      const {
+        sourceHash: _sourceHash,
+        result: _result,
+        logs: _logs,
+        ...summary
+      } = job;
+      return structuredClone(summary);
+    });
   }
   cancel(id: string) {
     const work = this.jobs.get(id);
@@ -176,9 +196,11 @@ export class JobQueue {
           work.abort.signal,
           (...values) => {
             if (isTerminal(work.job)) return;
-            const data = serialize(values, 64 * 1024);
-            const bytes = Buffer.byteLength(JSON.stringify(data));
-            if (work.logBytes + bytes <= 256 * 1024) {
+            const data = serialize(values, MAX_LOG_ENTRY_BYTES);
+            const bytes =
+              Buffer.byteLength(JSON.stringify(data)) +
+              (work.job.logs.length > 0 ? 1 : 0);
+            if (work.logBytes + bytes <= MAX_LOG_BYTES) {
               work.job.logs.push(data);
               work.logBytes += bytes;
             }
@@ -199,7 +221,7 @@ export class JobQueue {
     try {
       const outcome = await Promise.race([execution, aborted]);
       if (work.abort.signal.aborted || outcome.kind === "abort") {
-        this.hooks.cleanup(work.job.id);
+        this.hooks.abort?.(work.job.id);
         let grace: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([
           execution,

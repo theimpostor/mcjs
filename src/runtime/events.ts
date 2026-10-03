@@ -1,4 +1,8 @@
 import { McjsError } from "../errors.ts";
+import {
+  MAX_EVENT_PAYLOAD_BYTES,
+  MAX_EVENT_RESPONSE_BYTES,
+} from "../protocol.ts";
 import { type JsonValue, serialize } from "./serialize.ts";
 
 export class EventBuffer {
@@ -28,7 +32,7 @@ export class EventBuffer {
       generation,
       timestamp: new Date().toISOString(),
       type,
-      payload: serialize(payload, 64 * 1024),
+      payload: serialize(payload, MAX_EVENT_PAYLOAD_BYTES),
     });
     if (this.entries.length > this.capacity) this.entries.shift();
     return cursor;
@@ -58,9 +62,32 @@ export class EventBuffer {
           `Oldest available cursor: ${oldest.cursor}`,
         );
     }
+    const latestCursor = `${this.daemonId}:${this.botId}:${this.streamId}:${this.sequence}`;
+    const events: typeof this.entries = [];
+    let bytes = Buffer.byteLength(
+      JSON.stringify({ events, cursor: latestCursor, hasMore: false }),
+    );
+    let hasMore = false;
+    for (const entry of this.entries) {
+      if (entry.sequence <= sequence) continue;
+      const entryBytes =
+        Buffer.byteLength(JSON.stringify(entry)) + (events.length > 0 ? 1 : 0);
+      if (bytes + entryBytes > MAX_EVENT_RESPONSE_BYTES) {
+        if (events.length === 0)
+          throw new McjsError(
+            "RESULT_TOO_LARGE",
+            "Event exceeds response limit",
+          );
+        hasMore = true;
+        break;
+      }
+      events.push(entry);
+      bytes += entryBytes;
+    }
     return {
-      events: this.entries.filter((e) => e.sequence > sequence),
-      cursor: `${this.daemonId}:${this.botId}:${this.streamId}:${this.sequence}`,
+      events,
+      cursor: events.at(-1)?.cursor ?? latestCursor,
+      hasMore,
     };
   }
 }

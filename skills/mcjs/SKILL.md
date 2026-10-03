@@ -12,7 +12,7 @@ coordination or troubleshooting. Read [references/workflow.md](references/workfl
 for a short operating loop and failure handling.
 
 Create bots only for the user's requested server. Specify distinct identities.
-Use --auth offline only for an offline-mode server; the default is microsoft.
+Authentication defaults to offline. Use --auth microsoft for an online-mode server.
 Do not treat an alias as an additional licensed account. Wait until bot info
 reports ready. Reuse existing bots when their server and identity match the task.
 
