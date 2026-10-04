@@ -6,6 +6,7 @@ import { skillDirectory } from "./assets.ts";
 import { errorData, McjsError, requireValue } from "./errors.ts";
 import { Client } from "./ipc/client.ts";
 import { runtimePaths } from "./ipc/paths.ts";
+import { compactEnvelope, type OutputKind } from "./output.ts";
 import { packageRoot } from "./package-root.ts";
 import {
   botConfigSchema,
@@ -19,6 +20,7 @@ import { isTerminal, type Job } from "./runtime/jobs.ts";
 const options = {
   help: { type: "boolean", short: "h" },
   human: { type: "boolean" },
+  compact: { type: "boolean" },
   profile: { type: "string", default: "default" },
   socket: { type: "string" },
   host: { type: "string" },
@@ -36,6 +38,8 @@ const options = {
   "if-busy": { type: "string" },
   since: { type: "string" },
   follow: { type: "boolean" },
+  types: { type: "string" },
+  "include-empty": { type: "boolean" },
   dir: { type: "string" },
   force: { type: "boolean" },
   revision: { type: "string" },
@@ -60,16 +64,17 @@ mcjs exec <bot> '<JavaScript>' [--background --timeout-ms 30000 --wait-ms 30000]
 mcjs exec <bot> --stdin|--file script.ts [--lang js|ts]
 mcjs exec-all '<code>' | exec-many bot1,bot2 '<code>'
 mcjs jobs list | job get|wait|cancel <job-id>
-mcjs events <bot> [--since cursor --follow]
+mcjs events <bot> [--since cursor --follow --types chat,health --include-empty]
 mcjs inspect <bot> bot|bot.inventory|bot.pathfinder|bot.collectBlock|bot.tool|bot.pvp
 mcjs state get <bot> | state set <bot> '<JSON object>'
 mcjs shared get <key> | shared set <key> '<JSON>' --revision <n>
 mcjs docs [topic]
 mcjs skill path|print|install [--dir <skill-root> --force]
 
-Global: --profile default --socket <path> --human
+Global: --profile default --socket <path> --compact --human
 Bot authentication defaults to offline; use --auth microsoft for online-mode servers.
 JSON stdout by default. JavaScript runs as a trusted async function body; return results.
+--compact omits transport metadata and job bookkeeping; keeps states, results and errors.
 Use --stdin with a quoted heredoc to prevent shell interpolation. See mcjs docs.
 `;
 
@@ -82,26 +87,33 @@ export async function main(args = process.argv.slice(2)) {
   });
   const [command, action, target] = p;
   const client = new Client(runtimePaths(flags.profile, flags.socket));
-  const output = (data: unknown) =>
+  const emit = (envelope: Envelope, kind: OutputKind = "data") =>
     console.log(
-      flags.human && typeof data === "string"
-        ? data
-        : JSON.stringify(
-            {
-              protocolVersion: PROTOCOL,
-              requestId: crypto.randomUUID(),
-              ok: true,
-              data,
-              meta: { daemonId: "local", durationMs: 0 },
-            },
-            null,
-            flags.human ? 2 : undefined,
-          ),
+      JSON.stringify(
+        flags.compact ? compactEnvelope(envelope, kind) : envelope,
+        null,
+        flags.human ? 2 : undefined,
+      ),
     );
-  const emit = (envelope: Envelope) =>
-    console.log(JSON.stringify(envelope, null, flags.human ? 2 : undefined));
-  const rpc = async (method: string, params: unknown = {}) =>
-    emit(await client.rpc(method, params));
+  const output = (data: unknown, kind: OutputKind = "data") => {
+    if (flags.human && typeof data === "string") console.log(data);
+    else
+      emit(
+        {
+          protocolVersion: PROTOCOL,
+          requestId: crypto.randomUUID(),
+          ok: true,
+          data,
+          meta: { daemonId: "local", durationMs: 0 },
+        },
+        kind,
+      );
+  };
+  const rpc = async (
+    method: string,
+    params: unknown = {},
+    kind: OutputKind = "data",
+  ) => emit(await client.rpc(method, params), kind);
   const required = (value: string | undefined, name: string) =>
     requireValue(value, `Missing ${name}; run mcjs --help`);
   if (flags.help || !command) {
@@ -118,12 +130,17 @@ export async function main(args = process.argv.slice(2)) {
         "DOCS_NOT_FOUND",
         `Unknown topic ${topic}; run mcjs docs`,
       );
-    output({
-      topic,
-      text: await file.text(),
-      versions: (await Bun.file(join(packageRoot, "package.json")).json())
-        .dependencies,
-    });
+    const text = await file.text();
+    output(
+      flags.human
+        ? text
+        : {
+            topic,
+            text,
+            versions: (await Bun.file(join(packageRoot, "package.json")).json())
+              .dependencies,
+          },
+    );
     return;
   }
   if (command === "skill") {
@@ -308,7 +325,7 @@ export async function main(args = process.argv.slice(2)) {
       const result = await waitForReceipt(
         await client.rpc<Job>("exec.submit", inputs[0]),
       );
-      emit(result);
+      emit(result, "job");
       process.exitCode = jobExit(result.data);
       return;
     }
@@ -343,35 +360,53 @@ export async function main(args = process.argv.slice(2)) {
         }
       }),
     );
-    output(results);
+    output(results, "fleet");
     if (failures) process.exitCode = 6;
     return;
   }
   if (command === "jobs" && action === "list") {
-    await rpc("jobs.list");
+    await rpc("jobs.list", {}, "jobs");
     return;
   }
   if (command === "job") {
     const id = required(target, "job ID");
     if (action === "wait") {
       const result = await waitJob(id, numberOption(flags["wait-ms"], 30_000));
-      emit(result);
+      emit(result, "job");
       process.exitCode = jobExit(result.data);
     } else if (action === "get" || action === "cancel")
-      await rpc(`job.${action}`, { id });
+      await rpc(`job.${action}`, { id }, "job");
     else throw new McjsError("INVALID_ARGUMENT", "Use job get, wait or cancel");
     return;
   }
   if (command === "events") {
     const id = required(action, "bot ID");
+    const types = flags.types?.split(",").map((type) => type.trim());
+    if (types?.some((type) => !/^[a-z][a-z0-9_-]*$/.test(type)))
+      throw new McjsError(
+        "INVALID_ARGUMENT",
+        "--types expects comma-separated event types",
+      );
     let since = flags.since;
+    let first = true;
     do {
       const result = await client.rpc<{
-        events: unknown[];
+        events: { type: string }[];
         cursor: string;
         hasMore: boolean;
       }>("events", { id, since });
-      emit(result);
+      if (types && result.data)
+        result.data.events = result.data.events.filter((event) =>
+          types.includes(event.type),
+        );
+      if (
+        first ||
+        !flags.follow ||
+        flags["include-empty"] ||
+        result.data?.events.length
+      )
+        emit(result);
+      first = false;
       since = result.data?.cursor;
       if (flags.follow && !result.data?.hasMore) await Bun.sleep(500);
     } while (flags.follow);
@@ -415,14 +450,17 @@ export async function main(args = process.argv.slice(2)) {
 export async function runCli(args = process.argv.slice(2)) {
   await main(args).catch((error) => {
     const data = errorData(error);
+    const envelope: Envelope = {
+      protocolVersion: PROTOCOL,
+      requestId: "local",
+      ok: false,
+      error: data,
+      meta: { daemonId: "local", durationMs: 0 },
+    };
     console.log(
-      JSON.stringify({
-        protocolVersion: PROTOCOL,
-        requestId: "local",
-        ok: false,
-        error: data,
-        meta: { daemonId: "local", durationMs: 0 },
-      }),
+      JSON.stringify(
+        args.includes("--compact") ? compactEnvelope(envelope) : envelope,
+      ),
     );
     process.exitCode =
       data.code === "INVALID_ARGUMENT" ||

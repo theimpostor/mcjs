@@ -94,6 +94,24 @@ the RPC request succeeded. The CLI uses a nonzero exit code for failed jobs it
 waits for. `--background` and an elapsed `--wait-ms` return a pending job receipt.
 Closing the CLI does not cancel a job or disconnect a bot.
 
+For routine agent use, add `--compact`. Output stays JSON with `ok`, `data` and
+any RPC `error`, but omits transport IDs/metadata, job source hashes, timestamps
+and empty logs. Job IDs, bot generation, state, result, errors and nonempty logs
+are preserved, including fleet outcomes. Default output remains the full envelope.
+Compact output does not truncate user results or change exit codes.
+
+```sh
+mcjs exec scout 'return bot.health' --compact
+mcjs job wait <job-id> --wait-ms 10000 --compact
+mcjs events scout --types chat,health,death --follow --compact
+mcjs docs execution --human
+```
+
+Event follow prints an initial cursor batch, then only nonempty matching batches.
+Use `--include-empty` for every polling response. `--types` filters at the CLI;
+cursors still advance past excluded events. One-shot event reads always return a
+batch. Use `docs --human` for readable Markdown without JSON string escaping.
+
 ## Load the agent skill
 
 The bundled skill is [skills/mcjs/SKILL.md](skills/mcjs/SKILL.md).

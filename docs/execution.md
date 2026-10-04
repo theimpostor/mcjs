@@ -11,8 +11,17 @@ packages. TypeScript is transpiled, not type-checked at execution time. `log`
 and console.log/info/warn/error/debug append bounded job logs. Return compact
 JSON objects. Vec3, Item, Block and Entity values receive compact projections.
 Functions, BigInt, nonfinite numbers and cyclic objects are rejected.
+Other class instances, such as Recipe, need an explicit plain JSON projection.
+For large scans return a count and a bounded sample, storing coordinates in
+botState if a later call needs the full set. Output limits are ceilings, not targets.
 The serialized return value may be up to 1 MiB, with up to 256 KiB of retained
 log entries. Job retrieval includes room for both budgets and record metadata.
+
+Use --compact on exec, job get/wait/cancel and jobs list for routine observation.
+It keeps {ok,data,error}, omits transport metadata, and removes job source hashes,
+timestamps and empty logs. IDs, bot generation, state, result, errors and nonempty
+logs remain intact, including per-bot fleet outcomes. User result objects are
+never trimmed. Omit --compact to retrieve the complete records for diagnosis.
 
 In standalone builds, use the injected `Vec3`, `mcData`, `goals`, `Movements` and
 `bot` globals to access bundled libraries. Bundling does not install packages for
@@ -26,6 +35,10 @@ Navigation and collection helpers check cancellation around Mineflayer awaits.
 
 One job executes per bot. Other bots run concurrently. Use built-in bot snapshot,
 info and events to observe during a long job; another exec queues behind it.
+This includes chat-only exec calls. Update botState.progress during long loops
+and use state get for compact progress without queueing another program.
+Use job wait --wait-ms 10000 for a bounded wait, or events --types job --follow
+and fetch the result after the job reaches a terminal state.
 
 `mcjs job get <id>` returns state/result/error/logs; job wait polls; job cancel
 aborts; bot stop cancels pending work and clears plugin controls. Always inspect

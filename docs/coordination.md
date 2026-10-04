@@ -7,6 +7,12 @@ no transaction or rollback. exec-all snapshots ready bot IDs when it starts.
 Submission concurrency is bounded, but waiting for job completion does not hold
 up submission to the remaining bots.
 
+For agents sharing a daemon, assign one controller per bot and pass workers the
+same resolved executable and profile/socket. Partition regions or claim shared
+resources; a per-bot queue alone does not prevent two bots targeting one block.
+Observe another controller's bot using info/snapshot/events rather than queueing
+execs behind its work. Let the coordinator own daemon start/stop and chat intake.
+
 Use shared.get(key) to read {value, revision}. To update:
 
 ```js

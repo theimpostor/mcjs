@@ -47,4 +47,24 @@ test("invalid CLI requests fail with one JSON envelope", async () => {
   expect(result.envelope.error.code).toBe("INVALID_ARGUMENT");
   expect(result.stdout.trim().split("\n")).toHaveLength(1);
   expect((await cli("docs", "../package")).status).toBe(2);
+  const compact = await cli(
+    "exec",
+    "scout",
+    "return 1",
+    "--stdin",
+    "--compact",
+  );
+  expect(compact.status).toBe(2);
+  expect(Object.keys(compact.envelope).sort()).toEqual(["error", "ok"]);
+  expect(compact.envelope.error.code).toBe("INVALID_ARGUMENT");
+});
+
+test("human docs print readable Markdown without JSON escaping", async () => {
+  const child = Bun.spawn(
+    [process.execPath, "src/cli.ts", "docs", "execution", "--human"],
+    { stdout: "pipe", stderr: "pipe" },
+  );
+  const stdout = await new Response(child.stdout).text();
+  expect(await child.exited).toBe(0);
+  expect(stdout).toBe(`${await Bun.file("docs/execution.md").text()}\n`);
 });

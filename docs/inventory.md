@@ -9,6 +9,9 @@ available crafting recipes; await bot.craft(recipe, craftCount, craftingTable).
 Look up item IDs through mcData.itemsByName. Craft count counts recipe operations;
 it does not necessarily equal output item count. Navigate within reach of the
 crafting table before requesting table recipes.
+Check recipes.length before choosing one. Recipe instances are not supported
+return values: report `{available: recipes.length}` or project the fields needed
+into plain JSON instead of returning bot.recipesFor(...) directly.
 
 Open containers using await bot.openContainer(block). Await transfers. Close in
 finally. Coordinate a shared chest using a resource lease before interacting.
