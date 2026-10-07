@@ -89,6 +89,91 @@ test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
 );
 
 test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
+  "viewer commands validate options before RPC and preserve JSON output",
+  async () => {
+    const calls: { method: string; params: unknown }[] = [];
+    const viewer = {
+      url: "http://127.0.0.1:3007/",
+      port: 3007,
+      firstPerson: false,
+      viewDistance: 6,
+      generation: 1,
+    };
+    await withDaemon(
+      async (method, params) => {
+        calls.push({ method, params });
+        return method === "viewer.start"
+          ? viewer
+          : { id: "scout", stopped: true };
+      },
+      async (cli) => {
+        for (const args of [
+          ["viewer", "start"],
+          ["viewer", "start", "bad/id"],
+          ["viewer", "start", "scout", "extra"],
+          ["viewer", "start", "scout", "--port=-1"],
+          ["viewer", "start", "scout", "--port=65536"],
+          ["viewer", "start", "scout", "--port=bad"],
+          ["viewer", "start", "scout", "--port=1.5"],
+          ["viewer", "start", "scout", "--view-distance=0"],
+          ["viewer", "start", "scout", "--view-distance=17"],
+          ["viewer", "start", "scout", "--view-distance=bad"],
+          ["viewer", "stop", "bad/id"],
+          ["viewer", "stop", "scout", "--port=3007"],
+          ["viewer", "stop", "scout", "--first-person"],
+          ["viewer", "status", "scout"],
+        ]) {
+          const { status, result, lines } = await cli(...args);
+          expect(status).toBe(2);
+          expect(result.error?.code).toBe("INVALID_ARGUMENT");
+          expect(lines).toHaveLength(1);
+        }
+        expect(calls).toEqual([]);
+        const defaults = await cli("viewer", "start", "scout");
+        expect(defaults.status).toBe(0);
+        expect(defaults.lines).toHaveLength(1);
+        expect(defaults.result.data).toEqual(viewer);
+        const configured = await cli(
+          "viewer",
+          "start",
+          "scout",
+          "--port=3007",
+          "--first-person",
+          "--view-distance=12",
+          "--compact",
+        );
+        expect(configured.status).toBe(0);
+        expect(configured.result).toEqual({ ok: true, data: viewer });
+        const stopped = await cli("viewer", "stop", "scout");
+        expect(stopped.status).toBe(0);
+        expect(stopped.result.data).toEqual({ id: "scout", stopped: true });
+        expect(calls).toEqual([
+          {
+            method: "viewer.start",
+            params: {
+              id: "scout",
+              port: 0,
+              firstPerson: false,
+              viewDistance: 6,
+            },
+          },
+          {
+            method: "viewer.start",
+            params: {
+              id: "scout",
+              port: 3007,
+              firstPerson: true,
+              viewDistance: 12,
+            },
+          },
+          { method: "viewer.stop", params: { id: "scout" } },
+        ]);
+      },
+    );
+  },
+);
+
+test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
   "compact jobs retain outcomes and user data without changing full output or exit codes",
   async () => {
     const job = {

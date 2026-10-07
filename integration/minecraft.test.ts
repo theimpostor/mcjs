@@ -15,6 +15,9 @@ import { BotManager, type BotSession } from "../src/runtime/bots.ts";
 import { isTerminal, type Job } from "../src/runtime/jobs.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+const viewerInstalled = existsSync(
+  join(root, "node_modules/prismarine-viewer/package.json"),
+);
 const directory = mkdtempSync(join(tmpdir(), "mcjs-minecraft-"));
 const manager = new BotManager("integration", directory);
 const disconnects: Promise<void>[] = [];
@@ -83,7 +86,7 @@ beforeAll(async () => {
   await Promise.all(["scout", "builder"].map((id) => create(id)));
 }, 90_000);
 afterAll(async () => {
-  manager.stop();
+  await manager.stop();
   let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
@@ -131,6 +134,51 @@ async function create(id: string, plugins?: string[]) {
   return session;
 }
 
+async function observeViewer(url: string) {
+  const events = new Set<string>();
+  const endpoint = new URL("/socket.io/?EIO=4&transport=websocket", url);
+  endpoint.protocol = "ws:";
+  const socket = new WebSocket(endpoint.href);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`Viewer stream timed out: ${[...events]}`)),
+        10_000,
+      );
+      const fail = () => {
+        clearTimeout(timer);
+        reject(
+          new Error("Viewer stream disconnected before receiving world data"),
+        );
+      };
+      socket.onerror = fail;
+      socket.onclose = fail;
+      socket.onmessage = ({ data }) => {
+        const packet = String(data);
+        if (packet.startsWith("0")) socket.send("40");
+        else if (packet === "2") socket.send("3");
+        else if (packet.startsWith("42")) {
+          const [event] = JSON.parse(packet.slice(2)) as [string, unknown];
+          events.add(event);
+          if (
+            ["version", "position", "loadChunk"].every((name) =>
+              events.has(name),
+            )
+          ) {
+            clearTimeout(timer);
+            resolve();
+          }
+        }
+      };
+    });
+  } finally {
+    socket.onclose = null;
+    socket.onerror = null;
+    socket.close();
+  }
+  return events;
+}
+
 test("two Mineflayer bots join with default offline auth and plugins", () => {
   for (const session of manager.sessions.values()) {
     expect(session.bot.version).toBe(version);
@@ -142,6 +190,59 @@ test("two Mineflayer bots join with default offline auth and plugins", () => {
     expect(session.bot.entity.position.y).toBeGreaterThan(0);
   }
 });
+
+test.skipIf(!viewerInstalled)(
+  "independent loopback viewers serve browser assets and live world data, then release ports",
+  async () => {
+    const scout = manager.get("scout");
+    const builder = manager.get("builder");
+    try {
+      const [first, second] = await Promise.all([
+        scout.startViewer({ firstPerson: true, viewDistance: 2 }),
+        builder.startViewer({ viewDistance: 2 }),
+      ]);
+      expect(new URL(first.url).hostname).toBe("127.0.0.1");
+      expect(first.port).not.toBe(second.port);
+      expect(scout.info().viewer).toMatchObject({
+        url: first.url,
+        firstPerson: true,
+      });
+      const html = await fetch(first.url);
+      expect(html.status).toBe(200);
+      expect(await html.text()).toContain("Prismarine Viewer");
+      expect((await fetch(new URL("index.js", first.url))).status).toBe(200);
+      expect(await observeViewer(first.url)).toContain("loadChunk");
+      await scout.stopViewer();
+      expect(scout.info().viewer).toBeNull();
+      await expect(fetch(first.url)).rejects.toThrow();
+      expect((await fetch(second.url)).status).toBe(200);
+    } finally {
+      await Promise.all([scout.stopViewer(), builder.stopViewer()]);
+    }
+  },
+  20_000,
+);
+
+test.skipIf(!viewerInstalled)(
+  "reconnect and removal close viewers before completing",
+  async () => {
+    const original = await create("viewer_life");
+    try {
+      const first = await original.startViewer({ viewDistance: 2 });
+      await manager.reconnect("viewer_life");
+      const replacement = trackDisconnect(manager.get("viewer_life"));
+      await until(() => replacement.state === "ready");
+      expect(replacement.info().viewer).toBeNull();
+      await expect(fetch(first.url)).rejects.toThrow();
+      const second = await replacement.startViewer({ viewDistance: 2 });
+      await manager.remove("viewer_life");
+      await expect(fetch(second.url)).rejects.toThrow();
+    } finally {
+      await manager.remove("viewer_life");
+    }
+  },
+  20_000,
+);
 test("programs observe live inventory, preserve memory, coordinate and exchange chat", async () => {
   expect(
     await run(
@@ -190,7 +291,7 @@ test("background work cancels and disconnect interrupts work", async () => {
   const second = session.submit(
     execSchema.parse({ botId: "builder", code: "await helpers.sleep(10000)" }),
   );
-  manager.remove("builder");
+  await manager.remove("builder");
   await until(() => isTerminal(manager.jobQueue(second.id).get(second.id)));
   expect(manager.jobQueue(second.id).get(second.id).state).toBe("interrupted");
 });
@@ -264,7 +365,7 @@ test("quarantine survives death and respawn lifecycle notifications", async () =
       ),
     ).toThrow("quarantined");
   } finally {
-    manager.remove("quarantine");
+    await manager.remove("quarantine");
   }
 }, 30_000);
 
@@ -286,7 +387,7 @@ test("quarantine reached while respawn waits cannot be cleared", async () => {
     expect(session.state).toBe("quarantined");
     expect(session.generation).toBe(generation);
   } finally {
-    manager.remove("waiting");
+    await manager.remove("waiting");
   }
 }, 30_000);
 
@@ -303,7 +404,7 @@ test("reconnect copies nested memory before retiring the previous session", asyn
       }),
     );
     await until(() => old.botState.nested !== undefined);
-    manager.reconnect("memory");
+    await manager.reconnect("memory");
     const current = trackDisconnect(manager.get("memory"));
     expect(current.botState).not.toBe(old.botState);
     expect(current.botState.nested).not.toBe(old.botState.nested);
@@ -316,7 +417,7 @@ test("reconnect copies nested memory before retiring the previous session", asyn
     expect(manager.jobQueue(job.id).get(job.id).state).toBe("interrupted");
     expect(await run("memory", "return botState.nested.value")).toBe("saved");
   } finally {
-    manager.remove("memory");
+    await manager.remove("memory");
   }
 }, 30_000);
 
@@ -325,7 +426,7 @@ test("invalid reconnect memory leaves the current session connected", async () =
   const invalid = session.botState as Record<string, unknown>;
   invalid.unsupported = () => {};
   try {
-    expect(() => manager.reconnect("scout")).toThrow("Unsupported");
+    await expect(manager.reconnect("scout")).rejects.toThrow("Unsupported");
     expect(manager.get("scout")).toBe(session);
     expect(session.state).toBe("ready");
   } finally {
@@ -363,7 +464,7 @@ test("PVP cleanup allows the immediately following navigation job", async () => 
     expect(session.bot.pathfinder.movements.canDig).toBe(false);
     expect(session.bot.pathfinder.movements.allow1by1towers).toBe(false);
   } finally {
-    manager.remove("combat");
+    await manager.remove("combat");
   }
 }, 30_000);
 
@@ -385,13 +486,13 @@ test("job lookup avoids cloning histories across generations and removal", async
     session.bot.emit("spawn");
     await until(() => session.generation === 2);
     expect(manager.jobQueue(job.id)).toBe(queue);
-    manager.remove("lookup");
+    await manager.remove("lookup");
     expect(manager.jobQueue(job.id)).toBe(queue);
     expect(() => manager.jobQueue("missing-job")).toThrow("missing-job");
   } finally {
     list.mockRestore();
     summaries.mockRestore();
-    manager.remove("lookup");
+    await manager.remove("lookup");
   }
 }, 30_000);
 
@@ -409,6 +510,7 @@ test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
       PATH: emptyPath,
       MCJS_RUNTIME_DIR: join(working, "runtime"),
       MCJS_STATE_DIR: join(working, "state"),
+      MCJS_VIEWER_DIR: root,
     };
     delete env.BUN_BE_BUN;
     let daemonPid: number | undefined;
@@ -457,6 +559,22 @@ test.skipIf(process.env.MCJS_SKIP_UNIX === "1")(
       expect(info?.state).toBe("ready");
       expect(info?.plugins).toEqual(["pathfinder", "tool", "collectblock"]);
       daemonPid = (await compiled<{ pid: number }>("daemon", "status"))?.pid;
+      if (viewerInstalled) {
+        const viewer = await compiled<{ url: string; firstPerson: boolean }>(
+          "viewer",
+          "start",
+          "compiled",
+          "--first-person",
+          "--view-distance",
+          "2",
+        );
+        expect(viewer?.firstPerson).toBe(true);
+        if (!viewer) throw new Error("Compiled viewer did not return its URL");
+        expect((await fetch(viewer.url)).status).toBe(200);
+        expect(await observeViewer(viewer.url)).toContain("loadChunk");
+        await compiled("viewer", "stop", "compiled");
+        await expect(fetch(viewer.url)).rejects.toThrow();
+      }
       const js = await compiled<Job>(
         "exec",
         "compiled",

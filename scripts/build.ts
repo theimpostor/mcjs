@@ -10,6 +10,8 @@ const result = await Bun.build({
   root: ".",
   target: "bun",
   format: "esm",
+  // The optional viewer serves its installed browser assets from disk.
+  external: ["prismarine-viewer"],
   // Bun 1.4.2 still renames imported classes with keepNames enabled.
   // Mineflayer and our serializers dispatch on their constructor names.
   minify: {
@@ -28,7 +30,8 @@ const result = await Bun.build({
     autoloadDotenv: false,
     autoloadBunfig: false,
     autoloadTsconfig: false,
-    autoloadPackageJson: false,
+    // Runtime package main/exports resolution is needed for optional viewers.
+    autoloadPackageJson: true,
   },
 });
 

@@ -12,8 +12,10 @@ import {
   botConfigSchema,
   type Envelope,
   execSchema,
+  idSchema,
   PROTOCOL,
   VERSION,
+  viewerStartSchema,
 } from "./protocol.ts";
 import { isTerminal, type Job } from "./runtime/jobs.ts";
 
@@ -25,6 +27,8 @@ const options = {
   socket: { type: "string" },
   host: { type: "string" },
   port: { type: "string" },
+  "first-person": { type: "boolean" },
+  "view-distance": { type: "string" },
   username: { type: "string" },
   auth: { type: "string" },
   version: { type: "string" },
@@ -60,6 +64,8 @@ mcjs daemon start|status|stop
 mcjs doctor
 mcjs bot create <id> --username <name> [--host localhost --port 25565 --auth offline|microsoft]
 mcjs bot list|info|snapshot|stop|remove|reconnect [id]
+mcjs viewer start <id> [--port 0 --first-person --view-distance 6]
+mcjs viewer stop <id>
 mcjs exec <bot> '<JavaScript>' [--background --timeout-ms 30000 --wait-ms 30000]
 mcjs exec <bot> --stdin|--file script.ts [--lang js|ts]
 mcjs exec-all '<code>' | exec-many bot1,bot2 '<code>'
@@ -73,6 +79,7 @@ mcjs skill path|print|install [--dir <skill-root> --force]
 
 Global: --profile default --socket <path> --compact --human
 Bot authentication defaults to offline; use --auth microsoft for online-mode servers.
+Viewer listens on loopback only; port 0 selects an available port for each bot.
 JSON stdout by default. JavaScript runs as a trusted async function body; return results.
 --compact omits transport metadata and job bookkeeping; keeps states, results and errors.
 Use --stdin with a quoted heredoc to prevent shell interpolation. See mcjs docs.
@@ -251,6 +258,37 @@ export async function main(args = process.argv.slice(2)) {
     )
       throw new McjsError("INVALID_ARGUMENT", "Unknown bot command");
     await rpc(`bot.${action}`, { id });
+    return;
+  }
+  if (command === "viewer") {
+    if (action !== "start" && action !== "stop")
+      throw new McjsError("INVALID_ARGUMENT", "Use viewer start or stop");
+    if (p.length > 3)
+      throw new McjsError("INVALID_ARGUMENT", "Expected one viewer bot ID");
+    const id = idSchema.safeParse(required(target, "bot ID"));
+    if (!id.success) throw new McjsError("INVALID_ARGUMENT", id.error.message);
+    if (action === "stop") {
+      if (
+        flags.port !== undefined ||
+        flags["first-person"] !== undefined ||
+        flags["view-distance"] !== undefined
+      )
+        throw new McjsError(
+          "INVALID_ARGUMENT",
+          "Viewer options apply only to viewer start",
+        );
+      await rpc("viewer.stop", { id: id.data });
+    } else {
+      const input = viewerStartSchema.safeParse({
+        id: id.data,
+        port: numberOption(flags.port, 0),
+        firstPerson: flags["first-person"],
+        viewDistance: numberOption(flags["view-distance"], 6),
+      });
+      if (!input.success)
+        throw new McjsError("INVALID_ARGUMENT", input.error.message);
+      await rpc("viewer.start", input.data);
+    }
     return;
   }
   async function waitJob(id: string, waitMs: number) {

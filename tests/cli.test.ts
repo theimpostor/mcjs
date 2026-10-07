@@ -14,6 +14,7 @@ test("help and offline docs do not need a daemon", async () => {
   const help = await cli("--help");
   expect(help.status).toBe(0);
   expect(help.envelope.data).toContain("exec-many");
+  expect(help.envelope.data).toContain("viewer start <id>");
   for (const topic of [
     "index",
     "execution",

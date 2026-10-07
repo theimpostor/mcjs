@@ -26,6 +26,16 @@ export const botConfigSchema = z
   .strict();
 export type BotConfig = z.infer<typeof botConfigSchema>;
 
+export const viewerStartSchema = z
+  .object({
+    id: idSchema,
+    port: z.number().int().min(0).max(65535).default(0),
+    firstPerson: z.boolean().default(false),
+    viewDistance: z.number().int().min(1).max(16).default(6),
+  })
+  .strict();
+export type ViewerStartInput = z.infer<typeof viewerStartSchema>;
+
 export const execSchema = z
   .object({
     botId: idSchema,

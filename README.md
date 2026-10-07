@@ -30,14 +30,18 @@ production compilation, syntax and whitespace minification, tree shaking and
 ahead-of-time bytecode for all function depths. Identifier renaming is disabled:
 Bun 1.4.2's name-preservation option still renames dependency classes, breaking
 Mineflayer's constructor-name checks and result serialization. Embedded source maps
-preserve useful errors. Runtime discovery of `.env`, `bunfig.toml`,
-`tsconfig.json` and `package.json` is disabled for the compiled CLI; export
-configuration such as `MCJS_RUNTIME_DIR` and `XDG_STATE_HOME` in the environment.
+preserve useful errors. Runtime discovery of `.env`, `bunfig.toml`, and
+`tsconfig.json` is disabled for the compiled CLI; export configuration such as
+`MCJS_RUNTIME_DIR` and `XDG_STATE_HOME` in the environment. Runtime `package.json`
+loading remains enabled so optional viewer dependencies can resolve their
+package entrypoints and exports.
 
 The single binary includes the Bun runtime, CLI, daemon, Mineflayer dependencies,
 Minecraft data, docs and agent skill. Copy it to another machine with a compatible
 operating system and CPU architecture; no checkout, `node_modules`, or installed
-Bun is needed to run it. Build separately on each target platform.
+Bun is needed to run the core CLI. Build separately on each target platform.
+The optional browser viewer loads its package and assets from disk; they are not
+embedded in the executable. See [Browser viewer](#browser-viewer) for installation.
 
 The CLI starts another instance of the same binary in daemon mode when needed.
 That process keeps bots connected between CLI calls; help and docs do not load
@@ -112,6 +116,61 @@ Use `--include-empty` for every polling response. `--types` filters at the CLI;
 cursors still advance past excluded events. One-shot event reads always return a
 batch. Use `docs --human` for readable Markdown without JSON string escaping.
 
+## Browser viewer
+
+Watch a ready bot in your browser with the optional `prismarine-viewer` adapter:
+
+```sh
+mcjs viewer start scout
+mcjs bot info scout
+```
+
+Open the returned `url` on the machine running the daemon. Each bot gets its own
+HTTP server bound to `127.0.0.1` and an automatically selected free port. Bot info
+reports its active `viewer`, including URL, port, camera settings and generation;
+`viewer` is `null` when stopped. The browser shows the bot's loaded surroundings.
+Camera controls only change your view; move or operate the bot with `mcjs exec`.
+
+Third-person view is the default: drag to orbit, right-drag to pan, and scroll to
+zoom. To change the camera, port or view distance, stop the viewer and start it
+with the desired options:
+
+```sh
+mcjs viewer stop scout
+mcjs viewer start scout --first-person --port 3000 --view-distance 6
+```
+
+The view distance is a radius in chunks, from 1 to 16 (default 6), limited to
+chunks the bot already knows. `--port 0` selects a free port. Closing the browser
+leaves the viewer and bot running. `viewer stop` closes only the viewer. Removing,
+reconnecting or disconnecting the bot, death, respawn, dimension changes,
+quarantine, or stopping the daemon closes its viewer;
+start it explicitly again for the new connection.
+
+The regular `bun install --frozen-lockfile` includes the optional package and its
+browser assets. Use `bun install --frozen-lockfile --omit optional` for a core-only
+installation. Viewer dependencies load only when starting a viewer; help, docs
+and normal bot operations work without them.
+
+When running a copied executable outside the checkout, install the pinned viewer
+in a separate directory and export its location before starting the daemon:
+
+```sh
+mkdir -p "$HOME/.local/share/mcjs-viewer"
+cd "$HOME/.local/share/mcjs-viewer"
+bun add --exact prismarine-viewer@1.33.0
+export MCJS_VIEWER_DIR="$HOME/.local/share/mcjs-viewer"
+mcjs daemon start
+```
+
+`MCJS_VIEWER_DIR` points to the directory containing `node_modules`, not the
+package's `public` directory. A running daemon must be restarted to inherit a new
+environment variable; this also disconnects its bots. The tested package version
+is pinned because browser assets and server APIs must match. Minecraft 1.21.4 is
+included in that package's supported rendering versions. Rendering compatibility
+is separate from Mineflayer connection support.
+Read `mcjs docs viewer --human` for behavior, limits and troubleshooting.
+
 ## Load the agent skill
 
 The bundled skill is [skills/mcjs/SKILL.md](skills/mcjs/SKILL.md).
@@ -141,6 +200,8 @@ You can also tell an agent to read the repository's SKILL.md directly. Run
   bot memory and shared compare-and-set values and resource leases.
 - Pathfinder, tool selection and collection enabled by default; opt-in PVP
   with `--plugins pathfinder,tool,collectblock,pvp`.
+- Optional browser viewer per bot, loopback binding, first/third-person cameras,
+  explicit start/stop and cleanup when the connection ends.
 - Optimized compiled CLI, offline docs, packaged agent skill, Biome, type checking, unit/RPC tests,
   Unix-socket tests and Minecraft integration tests.
 
@@ -200,7 +261,7 @@ tests still run. CI does not set this flag.
 The full target design is [docs/spec.md](docs/spec.md). This first implementation
 intentionally leaves the following work visible:
 
-- Optional prismarine-viewer and armor-manager adapters and compatibility tests.
+- Optional armor-manager adapter and compatibility tests.
 - Disk checkpoints, saved bot definitions and bounded retention across repeated
   removals/reconnects (active-session completed job retention is bounded today).
 - Push streaming for events; `events --follow` currently drains available pages
@@ -210,5 +271,6 @@ intentionally leaves the following work visible:
   numbers currently refer to the transpiled wrapper.
 - Automated recovery of verified stale sockets/locks; current behavior refuses
   unresponsive existing endpoints and gives a diagnostic path.
-- Native Windows transport, per-bot process isolation and optional viewer distribution.
+- Native Windows transport, per-bot process isolation and bundling optional viewer
+  assets into a standalone executable.
 - Vanilla Java/current-protocol acceptance matrix and manual Microsoft auth checks.

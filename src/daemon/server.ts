@@ -13,6 +13,7 @@ import {
   PROTOCOL,
   requestSchema,
   VERSION,
+  viewerStartSchema,
 } from "../protocol.ts";
 import { BotManager } from "../runtime/bots.ts";
 import { serialize } from "../runtime/serialize.ts";
@@ -80,6 +81,15 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
         return bots.reconnect(botId.parse(params).id);
       case "bot.stop":
         return bots.get(botId.parse(params).id).stop();
+      case "viewer.start": {
+        const input = viewerStartSchema.parse(params);
+        return bots.get(input.id).startViewer(input);
+      }
+      case "viewer.stop": {
+        const { id } = botId.parse(params);
+        await bots.get(id).stopViewer();
+        return { id, stopped: true };
+      }
       case "exec.submit": {
         const input = execSchema.parse(params);
         return bots.get(input.botId).submit(input);
@@ -310,7 +320,7 @@ export async function startServer(paths: RuntimePaths, listen?: Listener) {
     if (stopTask) return stopTask;
     stopping = true;
     stopTask = (async () => {
-      bots.stop();
+      await bots.stop();
       // Let the shutdown receipt flush, but do not wait forever on another
       // client that leaves an HTTP request open.
       const deadline = close

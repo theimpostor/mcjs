@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../src/daemon/server.ts";
+import { McjsError } from "../src/errors.ts";
 import { runtimePaths } from "../src/ipc/paths.ts";
 import {
   execSchema,
@@ -94,6 +95,85 @@ test("a rejected state replacement preserves the previous state", async () => {
     expect((await rpc("state.get", { id: "scout" })).data).toEqual({
       previous: "preserved",
     });
+  } finally {
+    lookup.mockRestore();
+  }
+});
+
+test("viewer RPCs validate parameters before lookup and deduplicate retries", async () => {
+  const session = Object.create(BotSession.prototype) as BotSession;
+  const viewer = {
+    url: "http://127.0.0.1:3007/",
+    port: 3007,
+    firstPerson: false,
+    viewDistance: 6,
+    generation: 1,
+  };
+  const started: unknown[] = [];
+  let stops = 0;
+  session.startViewer = async (options) => {
+    started.push(options);
+    return viewer;
+  };
+  session.stopViewer = async () => {
+    stops++;
+  };
+  const lookup = spyOn(daemon.bots, "get").mockReturnValue(session);
+  try {
+    for (const params of [
+      {},
+      { id: "bad/id" },
+      { id: "scout", port: -1 },
+      { id: "scout", port: 65536 },
+      { id: "scout", port: 1.5 },
+      { id: "scout", firstPerson: "true" },
+      { id: "scout", viewDistance: 0 },
+      { id: "scout", viewDistance: 17 },
+      { id: "scout", host: "0.0.0.0" },
+    ])
+      expect((await rpc("viewer.start", params)).error.code).toBe(
+        "INVALID_ARGUMENT",
+      );
+    expect(
+      (await rpc("viewer.stop", { id: "scout", port: 3007 })).error.code,
+    ).toBe("INVALID_ARGUMENT");
+    expect(lookup).not.toHaveBeenCalled();
+    const startId = crypto.randomUUID();
+    const first = await rpc("viewer.start", { id: "scout" }, startId);
+    expect(first.data).toEqual(viewer);
+    expect((await rpc("viewer.start", { id: "scout" }, startId)).data).toEqual(
+      viewer,
+    );
+    expect(started).toEqual([
+      { id: "scout", port: 0, firstPerson: false, viewDistance: 6 },
+    ]);
+    expect(
+      (await rpc("viewer.start", { id: "scout", firstPerson: true }, startId))
+        .error.code,
+    ).toBe("REQUEST_ID_CONFLICT");
+    const stopId = crypto.randomUUID();
+    for (let attempt = 0; attempt < 2; attempt++)
+      expect((await rpc("viewer.stop", { id: "scout" }, stopId)).data).toEqual({
+        id: "scout",
+        stopped: true,
+      });
+    expect(stops).toBe(1);
+    for (const params of [
+      { id: "scout", port: 0, firstPerson: true, viewDistance: 1 },
+      { id: "scout", port: 65535, firstPerson: false, viewDistance: 16 },
+    ]) {
+      expect((await rpc("viewer.start", params)).ok).toBe(true);
+      expect(started.at(-1)).toEqual(params);
+    }
+    session.startViewer = async () => {
+      throw new McjsError("VIEWER_UNAVAILABLE", "Install prismarine-viewer");
+    };
+    expect((await rpc("viewer.start", { id: "scout" })).error).toEqual({
+      code: "VIEWER_UNAVAILABLE",
+      message: "Install prismarine-viewer",
+      retryable: false,
+    });
+    expect((await rpc("status")).ok).toBe(true);
   } finally {
     lookup.mockRestore();
   }

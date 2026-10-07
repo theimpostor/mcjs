@@ -1,7 +1,7 @@
 # mcjs API guide
 
 Use `mcjs docs <topic>` for execution, navigation, inventory, coordination,
-connection, or troubleshooting. Documentation works with the daemon stopped.
+connection, viewer, or troubleshooting. Documentation works with the daemon stopped.
 Use `mcjs bot info <id>` to check loaded plugins; package installation alone does
 not mean a plugin is active. `mcjs inspect <id> bot.pathfinder` lists live method
 names without invoking getters.

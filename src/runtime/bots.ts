@@ -14,6 +14,7 @@ import { abortableSleep, executeCode } from "./execute.ts";
 import { JobQueue, type JobSummary } from "./jobs.ts";
 import { type JsonValue, serialize } from "./serialize.ts";
 import { SharedStore } from "./state.ts";
+import { ViewerController, type ViewerOptions } from "./viewer.ts";
 
 export class BotSession {
   bot: Bot;
@@ -27,6 +28,11 @@ export class BotSession {
   authPrompt: { uri: string; code: string } | null = null;
   private spawnTimer: ReturnType<typeof setTimeout>;
   private retiredQueues: JobQueue[] = [];
+  private viewer = new ViewerController(() => ({
+    bot: this.bot,
+    generation: this.generation,
+    ready: this.state === "ready",
+  }));
   constructor(
     public config: BotConfig,
     daemonId: string,
@@ -82,6 +88,7 @@ export class BotSession {
     );
     this.bot.on("end", (reason) => {
       clearTimeout(this.spawnTimer);
+      this.closeViewer();
       if (!this.unavailable()) this.state = "disconnected";
       this.queue.interrupt("Minecraft connection ended");
       this.emit("disconnected", {
@@ -111,6 +118,7 @@ export class BotSession {
       clearTimeout(this.spawnTimer);
       if (this.unavailable()) return;
       if (spawned) {
+        this.closeViewer();
         this.state = "respawning";
         this.queue.interrupt("World changed or bot respawned");
         while (this.queue.busy) await Bun.sleep(10);
@@ -131,6 +139,7 @@ export class BotSession {
     });
     this.bot.on("death", () => {
       if (this.unavailable()) return;
+      this.closeViewer();
       this.queue.interrupt("Bot died");
       this.state = "respawning";
       this.emit("death", {});
@@ -138,6 +147,7 @@ export class BotSession {
     this.bot.on("respawn", () => {
       if (this.unavailable()) return;
       if (spawned) {
+        this.closeViewer();
         this.queue.interrupt("Dimension or world changed");
         this.state = "respawning";
       }
@@ -181,8 +191,10 @@ export class BotSession {
         if (generation === this.generation) this.stopControls();
       },
       quarantine: () => {
-        if (generation === this.generation && !this.unavailable())
+        if (generation === this.generation && !this.unavailable()) {
+          this.closeViewer();
           this.state = "quarantined";
+        }
       },
       changed: (job) =>
         this.events?.push("job", { id: job.id, state: job.state }, generation),
@@ -206,6 +218,19 @@ export class BotSession {
     if (!queue) throw new McjsError("JOB_NOT_FOUND", id);
     return queue;
   }
+  startViewer(options: ViewerOptions = {}) {
+    return this.viewer.start(options);
+  }
+  stopViewer() {
+    return this.viewer.stop();
+  }
+  private closeViewer() {
+    void this.stopViewer().catch((error: unknown) => {
+      this.emit("viewer_error", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
   info() {
     return {
       id: this.config.id,
@@ -219,6 +244,7 @@ export class BotSession {
       busy: this.queue.busy,
       lastError: this.lastError,
       authPrompt: this.authPrompt,
+      viewer: this.viewer.info(),
     };
   }
   snapshot() {
@@ -271,12 +297,13 @@ export class BotSession {
     this.stopControls();
     return this.info();
   }
-  remove() {
+  async remove() {
     clearTimeout(this.spawnTimer);
     this.state = "removed";
     this.queue.interrupt("Bot removed");
     this.stopControls();
     this.bot.end("mcjs bot removed");
+    await this.stopViewer();
     return { id: this.config.id, removed: true };
   }
   private async execute(
@@ -367,6 +394,9 @@ export class BotManager {
   readonly shared = new SharedStore();
   readonly sessions = new Map<string, BotSession>();
   private retired: BotSession[] = [];
+  private lifecycle = new Map<string, Promise<unknown>>();
+  private stopping = false;
+  private stopTask: Promise<void> | undefined;
   constructor(
     private daemonId: string,
     private authDir: string,
@@ -377,6 +407,13 @@ export class BotManager {
     return session;
   }
   create(config: BotConfig) {
+    if (this.lifecycle.has(config.id))
+      throw new McjsError(
+        "BOT_BUSY",
+        `${config.id}: lifecycle change is in progress`,
+      );
+    if (this.stopping)
+      throw new McjsError("DAEMON_STOPPING", "Bot manager is shutting down");
     if (this.sessions.has(config.id))
       throw new McjsError("BOT_EXISTS", config.id);
     if (
@@ -400,29 +437,48 @@ export class BotManager {
     this.sessions.set(config.id, session);
     return session.info();
   }
+  private mutate<T>(id: string, action: () => Promise<T>): Promise<T> {
+    if (this.lifecycle.has(id))
+      return Promise.reject(
+        new McjsError("BOT_BUSY", `${id}: lifecycle change is in progress`),
+      );
+    const operation = Promise.resolve().then(action);
+    this.lifecycle.set(id, operation);
+    void operation.finally(() => this.lifecycle.delete(id)).catch(() => {});
+    return operation;
+  }
   remove(id: string) {
-    const session = this.sessions.get(id);
-    if (session) {
-      session.remove();
-      this.retired.push(session);
-      this.sessions.delete(id);
-    }
-    return { id, removed: true };
+    return this.mutate(id, async () => {
+      const session = this.sessions.get(id);
+      if (session) {
+        await session.remove();
+        this.retired.push(session);
+        this.sessions.delete(id);
+      }
+      return { id, removed: true };
+    });
   }
   reconnect(id: string) {
-    const old = this.get(id);
-    const state = serialize(old.botState) as Record<string, JsonValue>;
-    this.remove(id);
-    const session = new BotSession(
-      old.config,
-      this.daemonId,
-      this.authDir,
-      this.shared,
-      old.generation + 1,
-    );
-    session.botState = state;
-    this.sessions.set(id, session);
-    return session.info();
+    if (this.stopping)
+      return Promise.reject(
+        new McjsError("DAEMON_STOPPING", "Bot manager is shutting down"),
+      );
+    return this.mutate(id, async () => {
+      const old = this.get(id);
+      const state = serialize(old.botState) as Record<string, JsonValue>;
+      await old.remove();
+      const session = new BotSession(
+        old.config,
+        this.daemonId,
+        this.authDir,
+        this.shared,
+        old.generation + 1,
+      );
+      session.botState = state;
+      this.retired.push(old);
+      this.sessions.set(id, session);
+      return session.info();
+    });
   }
   jobs(): JobSummary[] {
     return [...this.retired, ...this.sessions.values()].flatMap((s) =>
@@ -437,6 +493,11 @@ export class BotManager {
     return session.jobQueue(id);
   }
   stop() {
-    for (const id of this.sessions.keys()) this.remove(id);
+    this.stopping = true;
+    this.stopTask ??= (async () => {
+      await Promise.allSettled(this.lifecycle.values());
+      await Promise.all([...this.sessions.keys()].map((id) => this.remove(id)));
+    })();
+    return this.stopTask;
   }
 }

@@ -36,5 +36,8 @@
   "packageManager": "bun@1.4.2",
   "engines": {
     "bun": ">=1.4.2"
+  },
+  "optionalDependencies": {
+    "prismarine-viewer": "1.33.0"
   }
 }
